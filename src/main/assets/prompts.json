@@ -1,0 +1,24 @@
+{
+  "defaults": {
+    "unknownApp": "未知应用",
+    "unknownTitle": "未命名窗口",
+    "unknownWindow": "未知窗口",
+    "imageHintWithImage": "有截图",
+    "imageHintWithoutImage": "无截图"
+  },
+  "contextLines": {
+    "app": "应用: {{appName}}",
+    "title": "标题: {{title}}",
+    "fallbackApp": "应用: {{unknownApp}}",
+    "fallbackTitle": "标题: {{unknownWindow}}"
+  },
+  "promptLines": [
+    "只做一件事：输出一句中文网友口吻吐槽。",
+    "要求：20-100字，可用emoji/颜文字；不要解释，不要编号，不要前后缀；别太正式。",
+    "风格: {{style}}",
+    "视觉: {{imageHint}}",
+    "上下文:",
+    "{{contextBlock}}",
+    "现在直接给一句成品。"
+  ]
+}
