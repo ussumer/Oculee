@@ -11,11 +11,13 @@ const HOTKEY = 'Control+Alt+T'
 const HOTKEY_COOLDOWN_MS = 5000
 const HOTKEY_REGISTER_FAILED_MESSAGE = '热键注册失败'
 const HOTKEY_FALLBACK_MESSAGE = '先深呼吸再继续'
+const HOTKEY_BUSY_MESSAGE = '处理中，请稍等'
 const MAX_TOAST_LENGTH = 100
 const DEBUG_WINDOW_CONTEXT = false
 const ROAST_STYLE = 'default'
 
 const hotkeyCooldown = makeCooldown(HOTKEY_COOLDOWN_MS)
+let hotkeyInFlight = false
 
 function clampToastText(text: string): string {
   return trimAndClampByCodePoints(text, MAX_TOAST_LENGTH)
@@ -63,14 +65,19 @@ function debugWindowContext(context: WindowContext): void {
 }
 
 async function onHotkeyPressed(): Promise<void> {
-  try {
-    const now = Date.now()
-    if (hotkeyCooldown.isCooling(now)) {
-      sendToast(formatCooldownText(hotkeyCooldown.remainingMs(now)))
-      return
-    }
+  const now = Date.now()
+  if (hotkeyCooldown.isCooling(now)) {
+    sendToast(formatCooldownText(hotkeyCooldown.remainingMs(now)))
+    return
+  }
+  if (hotkeyInFlight) {
+    sendToast(HOTKEY_BUSY_MESSAGE)
+    return
+  }
 
-    hotkeyCooldown.mark(now)
+  hotkeyCooldown.mark(now)
+  hotkeyInFlight = true
+  try {
     let context: WindowContext | undefined
     try {
       context = await getWindowContext()
@@ -96,6 +103,8 @@ async function onHotkeyPressed(): Promise<void> {
   } catch (error) {
     console.error('[hotkey] callback failed', error)
     sendToast(HOTKEY_FALLBACK_MESSAGE)
+  } finally {
+    hotkeyInFlight = false
   }
 }
 

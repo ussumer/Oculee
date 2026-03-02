@@ -17,8 +17,10 @@
     "typescript": "^5.7.3"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^3.0.37",
     "@google/generative-ai": "^0.24.1",
     "active-win": "^8.2.1",
+    "ai": "^6.0.105",
     "screenshot-desktop": "^1.15.3",
     "zod": "^4.3.6"
   }

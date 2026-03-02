@@ -18,6 +18,15 @@ export interface LlmRoastRequest {
   image?: LlmImagePart
 }
 
+export interface LlmConfig {
+  apiKey: string
+  apiUrl: string
+  model: string
+  timeoutMs: number
+  maxOutputTokens: number
+  temperature: number
+}
+
 export class LlmError extends Error {
   readonly code: LlmErrorCode
 
@@ -39,44 +48,54 @@ const OpenAIChatCompletionResponseSchema = z.object({
   choices: z
     .array(
       z.object({
-        message: z
-          .object({
-            content: z.union([z.string().trim().min(1), OpenAIContentPartsSchema.min(1)])
-          })
-          .optional(),
-        text: z.string().trim().min(1).optional()
+        message: z.object({
+          content: z.union([z.string().trim().min(1), OpenAIContentPartsSchema.min(1)])
+        })
       })
     )
     .min(1)
 })
 
-function normalizeTimeoutMs(value: string | undefined): number {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_TIMEOUT_MS
-  }
-  return Math.floor(parsed)
+const UrlStringSchema = z.preprocess(
+  (value) => (typeof value === 'string' ? value.trim() : value),
+  z.url()
+)
+
+const LlmConfigSchema = z.object({
+  apiKey: z.string().trim().default('').catch(''),
+  apiUrl: UrlStringSchema.default(DEFAULT_API_URL).catch(DEFAULT_API_URL),
+  model: z.string().trim().min(1).default(DEFAULT_MODEL).catch(DEFAULT_MODEL),
+  timeoutMs: z.coerce.number().int().positive().default(DEFAULT_TIMEOUT_MS).catch(DEFAULT_TIMEOUT_MS),
+  maxOutputTokens: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(DEFAULT_MAX_OUTPUT_TOKENS)
+    .catch(DEFAULT_MAX_OUTPUT_TOKENS),
+  temperature: z.coerce
+    .number()
+    .nonnegative()
+    .default(DEFAULT_TEMPERATURE)
+    .catch(DEFAULT_TEMPERATURE)
+})
+
+function parseEnvConfig(): LlmConfig {
+  return LlmConfigSchema.parse({
+    apiKey: process.env.LLM_API_KEY,
+    apiUrl: process.env.LLM_API_URL,
+    model: process.env.LLM_MODEL,
+    timeoutMs: process.env.LLM_TIMEOUT_MS,
+    maxOutputTokens: process.env.LLM_MAX_OUTPUT_TOKENS,
+    temperature: process.env.LLM_TEMPERATURE
+  })
 }
 
-function normalizeMaxOutputTokens(value: string | undefined): number {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_MAX_OUTPUT_TOKENS
+function resolveApiUrl(apiUrl: string): URL {
+  try {
+    return new URL(apiUrl)
+  } catch {
+    throw new LlmError('REQUEST_FAILED', `Invalid API URL: ${apiUrl}`)
   }
-  return Math.floor(parsed)
-}
-
-function normalizeTemperature(value: string | undefined): number {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return DEFAULT_TEMPERATURE
-  }
-  return parsed
-}
-
-function resolveApiUrl(): URL {
-  const directUrl = process.env.LLM_API_URL?.trim()
-  return new URL(directUrl || DEFAULT_API_URL)
 }
 
 function buildRequestBody(
@@ -123,36 +142,20 @@ function extractTextFromResponse(payload: string): string {
   }
 
   const choice = parsed.data.choices[0]
-  const content = choice.message?.content
-
-  if (typeof content === 'string') {
-    return content.trim()
-  }
-  if (Array.isArray(content) && content[0]) {
-    return content[0].text.trim()
-  }
-  if (choice.text) {
-    return choice.text.trim()
-  }
-
-  throw new LlmError('EMPTY_TEXT', 'OpenAI response has no text')
+  const content = choice.message.content
+  return typeof content === 'string' ? content.trim() : content[0].text.trim()
 }
 
-export function hasLlmApiKey(): boolean {
-  return Boolean(process.env.LLM_API_KEY?.trim())
-}
-
-export async function generateLlmRoast(request: LlmRoastRequest): Promise<string> {
-  const apiKey = process.env.LLM_API_KEY?.trim()
+export async function generateLlmRoast(request: LlmRoastRequest, config: LlmConfig): Promise<string> {
+  const envConfig = parseEnvConfig()
+  const resolvedConfig = LlmConfigSchema.parse({ ...envConfig, ...config })
+  const apiKey = resolvedConfig.apiKey
   if (!apiKey) {
     throw new LlmError('MISSING_KEY', 'LLM API key is missing')
   }
 
-  const model = process.env.LLM_MODEL?.trim() || DEFAULT_MODEL
-  const timeoutMs = normalizeTimeoutMs(process.env.LLM_TIMEOUT_MS)
-  const maxOutputTokens = normalizeMaxOutputTokens(process.env.LLM_MAX_OUTPUT_TOKENS)
-  const temperature = normalizeTemperature(process.env.LLM_TEMPERATURE)
-  const endpoint = resolveApiUrl()
+  const { model, timeoutMs, maxOutputTokens, temperature } = resolvedConfig
+  const endpoint = resolveApiUrl(resolvedConfig.apiUrl)
 
   const body = buildRequestBody(request.prompt, model, request.image, maxOutputTokens, temperature)
   const headers: Record<string, string> = {
