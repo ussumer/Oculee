@@ -1,4 +1,6 @@
 import { nativeImage, screen } from 'electron'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { WindowBounds } from '../../shared/types'
 import { dataLoader } from '../dataLoader'
@@ -9,6 +11,7 @@ const DEFAULT_MAX_BYTES = 180_000
 const MIN_SIDE = 320
 const DEFAULT_CODEC = 'jpeg'
 const DEFAULT_JPEG_QUALITY = 72
+const DEFAULT_DEBUG_CAPTURE_DIR = '.debug/roast-captures'
 
 type ScreenshotFn = (options?: Record<string, unknown>) => Promise<Buffer>
 type ImageCodec = 'png' | 'jpeg'
@@ -56,6 +59,10 @@ function isMultimodalEnabled(): boolean {
   return parseBoolean(process.env.MULTIMODAL_ENABLED, true)
 }
 
+function isCaptureDumpEnabled(): boolean {
+  return parseBoolean(process.env.MULTIMODAL_DEBUG_DUMP, false)
+}
+
 function getMaxSide(): number {
   return parsePositiveInt(process.env.MULTIMODAL_IMAGE_MAX_SIDE, 720)
 }
@@ -86,6 +93,38 @@ function getCaptureMode(config: CaptureConfig): CaptureMode {
     return 'fullscreen'
   }
   return config.captureMode
+}
+
+function getDebugCaptureDir(): string {
+  const custom = process.env.MULTIMODAL_DEBUG_DUMP_DIR?.trim()
+  return custom ? resolve(custom) : resolve(process.cwd(), DEFAULT_DEBUG_CAPTURE_DIR)
+}
+
+function buildDebugCaptureFilename(codec: ImageCodec): string {
+  const now = new Date()
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    '-',
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+    String(now.getSeconds()).padStart(2, '0'),
+    '-',
+    String(now.getMilliseconds()).padStart(3, '0')
+  ].join('')
+  const ext = codec === 'png' ? 'png' : 'jpg'
+  return `capture-${stamp}.${ext}`
+}
+
+async function dumpCaptureForDebug(buffer: Buffer, codec: ImageCodec): Promise<void> {
+  const dir = getDebugCaptureDir()
+  const file = join(dir, buildDebugCaptureFilename(codec))
+  await mkdir(dir, { recursive: true })
+  await writeFile(file, buffer)
+  if (parseBoolean(process.env.DEBUG_LLM, false)) {
+    console.log('[capture] saved debug image', file)
+  }
 }
 
 async function loadScreenshotFn(): Promise<ScreenshotFn> {
@@ -253,6 +292,14 @@ export async function captureRoastImage(windowBounds?: WindowBounds | null): Pro
       codec,
       getJpegQuality()
     )
+
+    if (isCaptureDumpEnabled()) {
+      try {
+        await dumpCaptureForDebug(optimized, codec)
+      } catch {
+        // Ignore debug dump errors to avoid blocking roast flow.
+      }
+    }
 
     return {
       mimeType: codec === 'png' ? 'image/png' : 'image/jpeg',

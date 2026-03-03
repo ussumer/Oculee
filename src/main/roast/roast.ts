@@ -1,10 +1,13 @@
 import { roastLocal } from '../roastLocal'
 import type { WindowContext } from '../../shared/types'
 import { captureRoastImage } from './capture'
-import { LlmError, type LlmConfig, type LlmErrorCode, generateLlmRoast } from './llmClient'
+import { LlmError, type LlmConfig, type LlmErrorCode, streamLlmRoast } from './llmClient'
 import { buildRoastPrompt } from './prompt'
-import { clampByCodePoints, codePointLength } from '../../shared/utils/stringUtils'
+import { codePointLength, trimAndClampByCodePoints } from '../../shared/utils/stringUtils'
 import { z } from 'zod'
+import { getOverlayWindow } from '../windowManager'
+import { APICallError, AISDKError } from 'ai'
+import { TOAST_SHOW_CHANNEL, type ToastShowPayload } from '../../shared/ipc'
 
 const MAX_TOAST_LENGTH = 100
 const MIN_TOAST_LENGTH = 8
@@ -12,13 +15,11 @@ const MISSING_KEY_NOTICE = '未配置KEY，使用本地吐槽'
 const FALLBACK_TEXT = '先深呼吸再继续'
 const DEFAULT_MODEL = 'gpt-4o-mini'
 const DEFAULT_TIMEOUT_MS = 5000
-const DEFAULT_API_URL = 'https://api.openai.com/v1/chat/completions'
+const DEFAULT_API_URL = 'https://api.openai.com/v1'
 const DEFAULT_MAX_OUTPUT_TOKENS = 180
 const DEFAULT_TEMPERATURE = 1.1
-
-const PREFIX_LABEL_REGEX = /^(吐槽|建议|回复|输出|结果|一句话|答案)[:：]\s*/i
-const LEADING_CHATTER_REGEX = /^(好的|当然|那么|这里是|你可以|可以说|给你一句|建议你|不妨|请)\s*/i
-const LIST_PREFIX_REGEX = /^([0-9]+[).、]|[-*•])\s*/
+const STREAM_RENDER_CHARS_PER_TICK = 4
+const STREAM_RENDER_DELAY_MS = 20
 
 type RoastRoute = 'PRIMARY' | 'FLASH_API' | 'LOCAL_FALLBACK'
 type RoastReason = LlmErrorCode | 'UNKNOWN' | 'OK' | 'TOO_SHORT'
@@ -40,38 +41,19 @@ function isDebugEnabled(): boolean {
 }
 
 function clampText(text: string): string {
-  return clampByCodePoints(text, MAX_TOAST_LENGTH)
+  return trimAndClampByCodePoints(text, MAX_TOAST_LENGTH)
 }
 
 function textLength(text: string): number {
   return codePointLength(text)
 }
 
-function cleanRoastText(input: string, ctx?: WindowContext): string {
-  void ctx
-
-  const firstLine = input
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/\r/g, '\n')
-    .split('\n')
-    .map((line) => line.trim())
-    .find((line) => line.length > 0)
-
-  let normalized = firstLine ?? ''
-  normalized = normalized.replace(LIST_PREFIX_REGEX, '')
-  normalized = normalized.replace(PREFIX_LABEL_REGEX, '')
-  normalized = normalized.replace(LEADING_CHATTER_REGEX, '')
-  normalized = normalized.replace(/\s+/g, ' ').trim()
-
-  return clampText(normalized)
-}
-
 function getFallbackText(ctx?: WindowContext, style?: string): string {
-  const local = cleanRoastText(roastLocal(ctx, style), ctx)
+  const local = clampText(roastLocal(ctx, style))
   if (local) {
     return local
   }
-  return cleanRoastText(FALLBACK_TEXT, ctx)
+  return clampText(FALLBACK_TEXT)
 }
 
 function readEnv(...keys: string[]): string | undefined {
@@ -150,6 +132,138 @@ function maybeQueueMissingKeyNotice(reason: LlmErrorCode | 'UNKNOWN'): void {
   pendingNotice = MISSING_KEY_NOTICE
 }
 
+function pushToastText(text: string): void {
+  const content = clampText(text)
+  if (!content) {
+    return
+  }
+  const overlayWindow = getOverlayWindow()
+  if (!overlayWindow || overlayWindow.isDestroyed()) {
+    return
+  }
+  const payload: ToastShowPayload = { text: content }
+  overlayWindow.webContents.send(TOAST_SHOW_CHANNEL, payload)
+}
+
+function splitByCodePoints(text: string, size: number): string[] {
+  const normalizedSize = Math.max(1, Math.floor(size))
+  const units = Array.from(text)
+  const chunks: string[] = []
+  for (let i = 0; i < units.length; i += normalizedSize) {
+    chunks.push(units.slice(i, i + normalizedSize).join(''))
+  }
+  return chunks
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+async function appendToastChunkWithPacing(currentText: string, chunk: string): Promise<string> {
+  const parts = splitByCodePoints(chunk, STREAM_RENDER_CHARS_PER_TICK)
+  let nextText = currentText
+  for (let i = 0; i < parts.length; i += 1) {
+    nextText += parts[i]
+    pushToastText(nextText)
+    if (STREAM_RENDER_DELAY_MS > 0 && i < parts.length - 1) {
+      await sleep(STREAM_RENDER_DELAY_MS)
+    }
+  }
+  return nextText
+}
+
+type StreamPart = {
+  type: string
+  [key: string]: unknown
+}
+
+interface StreamedRoastResult {
+  fullStream: AsyncIterable<StreamPart>
+}
+
+function readPartString(part: StreamPart, key: string): string | undefined {
+  const value = part[key]
+  return typeof value === 'string' ? value : undefined
+}
+
+function debugFullStreamEvent(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, part: StreamPart): void {
+  if (!isDebugEnabled()) {
+    return
+  }
+
+  if (part.type === 'tool-call' || part.type === 'tool-result') {
+    console.log('[roast:stream]', {
+      route,
+      type: part.type,
+      toolName: readPartString(part, 'toolName'),
+      toolCallId: readPartString(part, 'toolCallId')
+    })
+    return
+  }
+
+  if (part.type === 'finish-step' || part.type === 'finish') {
+    console.log('[roast:stream]', {
+      route,
+      type: part.type,
+      finishReason: readPartString(part, 'finishReason'),
+      rawFinishReason: readPartString(part, 'rawFinishReason')
+    })
+  }
+}
+
+function toStreamError(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, error: unknown): LlmError {
+  if (error instanceof LlmError) {
+    return error
+  }
+  if (APICallError.isInstance(error)) {
+    if (error.statusCode === 408 || /timed?\s*out|timeout/i.test(error.message)) {
+      return new LlmError('TIMEOUT', `${route} stream timeout: ${error.message}`)
+    }
+    return new LlmError('REQUEST_FAILED', `${route} stream request failed: ${error.message}`)
+  }
+  if (error instanceof Error && error.name === 'AbortError') {
+    return new LlmError('TIMEOUT', `${route} stream aborted`)
+  }
+  if (error instanceof Error) {
+    return new LlmError('REQUEST_FAILED', `${route} stream error: ${error.message}`)
+  }
+  return new LlmError('REQUEST_FAILED', `${route} stream error: ${String(error)}`)
+}
+
+async function collectStreamedText(
+  route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>,
+  result: StreamedRoastResult
+): Promise<string> {
+  let text = ''
+  for await (const part of result.fullStream) {
+    switch (part.type) {
+      case 'text-delta': {
+        const chunk = readPartString(part, 'text')
+        if (!chunk) {
+          break
+        }
+        text = await appendToastChunkWithPacing(text, chunk)
+        break
+      }
+      case 'tool-call':
+      case 'tool-result':
+      case 'finish-step':
+      case 'finish':
+        debugFullStreamEvent(route, part)
+        break
+      case 'abort':
+        throw new LlmError('TIMEOUT', `${route} stream aborted`)
+      case 'error':
+        throw toStreamError(route, part.error)
+      default:
+        break
+    }
+  }
+  return clampText(text)
+}
+
 function debugLog(data: {
   durationMs: number
   route: RoastRoute
@@ -195,6 +309,48 @@ function logResult(
   })
 }
 
+function debugRouteError(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, error: unknown): void {
+  if (!isDebugEnabled()) {
+    return
+  }
+
+  if (APICallError.isInstance(error)) {
+    console.log('[roast:error]', {
+      route,
+      type: 'APICallError',
+      message: error.message,
+      statusCode: error.statusCode,
+      isRetryable: error.isRetryable,
+      responseBody: error.responseBody?.slice(0, 200)
+    })
+    return
+  }
+
+  if (AISDKError.isInstance(error)) {
+    console.log('[roast:error]', {
+      route,
+      type: error.name,
+      message: error.message
+    })
+    return
+  }
+
+  if (error instanceof Error) {
+    console.log('[roast:error]', {
+      route,
+      type: error.name,
+      message: error.message
+    })
+    return
+  }
+
+  console.log('[roast:error]', {
+    route,
+    type: 'UnknownNonError',
+    error: String(error)
+  })
+}
+
 export function consumeRoastNotice(): string | null {
   if (!pendingNotice) {
     return null
@@ -221,11 +377,11 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
     const primaryPrompt = buildRoastPrompt(ctx, style, { hasImage: usedImage })
 
     try {
-      const primaryTextRaw = await generateLlmRoast({ prompt: primaryPrompt, image }, primaryConfig)
-      const primaryText = cleanRoastText(primaryTextRaw, ctx)
+      const primaryResult = streamLlmRoast({ prompt: primaryPrompt, image }, primaryConfig)
+      const primaryText = await collectStreamedText('PRIMARY', primaryResult)
 
       if (!primaryText) {
-        throw new LlmError('EMPTY_TEXT', 'PRIMARY text empty after clean')
+        throw new LlmError('EMPTY_TEXT', 'PRIMARY text empty after stream')
       }
       if (textLength(primaryText) < MIN_TOAST_LENGTH) {
         primaryReason = 'TOO_SHORT'
@@ -250,15 +406,16 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
       })
       return primaryText
     } catch (primaryError: unknown) {
+      debugRouteError('PRIMARY', primaryError)
       primaryReason = toErrorCode(primaryError)
       const flashPrompt = usedImage ? buildRoastPrompt(ctx, style, { hasImage: false }) : primaryPrompt
 
       try {
-        const flashTextRaw = await generateLlmRoast({ prompt: flashPrompt }, flashConfig)
-        const flashText = cleanRoastText(flashTextRaw, ctx)
+        const flashResult = streamLlmRoast({ prompt: flashPrompt }, flashConfig)
+        const flashText = await collectStreamedText('FLASH_API', flashResult)
 
         if (!flashText) {
-          throw new LlmError('EMPTY_TEXT', 'FLASH_API text empty after clean')
+          throw new LlmError('EMPTY_TEXT', 'FLASH_API text empty after stream')
         }
         if (textLength(flashText) < MIN_TOAST_LENGTH) {
           flashReason = 'TOO_SHORT'
@@ -283,6 +440,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
         })
         return flashText
       } catch (flashError: unknown) {
+        debugRouteError('FLASH_API', flashError)
         flashReason = toErrorCode(flashError)
         throw flashError
       }
@@ -308,6 +466,27 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
 function toErrorCode(error: unknown): LlmErrorCode | 'UNKNOWN' {
   if (error instanceof LlmError) {
     return error.code
+  }
+  if (APICallError.isInstance(error)) {
+    if (error.statusCode === 408 || /timed?\s*out|timeout/i.test(error.message)) {
+      return 'TIMEOUT'
+    }
+    return 'REQUEST_FAILED'
+  }
+  if (AISDKError.isInstance(error)) {
+    if (/timed?\s*out|timeout/i.test(error.message)) {
+      return 'TIMEOUT'
+    }
+    return 'REQUEST_FAILED'
+  }
+  if (error instanceof Error && error.name === 'AbortError') {
+    return 'TIMEOUT'
+  }
+  if (error instanceof Error) {
+    if (/timed?\s*out|timeout/i.test(error.message)) {
+      return 'TIMEOUT'
+    }
+    return 'REQUEST_FAILED'
   }
   return 'UNKNOWN'
 }

@@ -1,10 +1,16 @@
+import { createOpenAI } from '@ai-sdk/openai'
+import { stepCountIs, streamText, type ModelMessage } from 'ai'
 import { z } from 'zod'
+import { banterTools } from './tools'
 
 const DEFAULT_MODEL = 'gpt-4o-mini'
 const DEFAULT_TIMEOUT_MS = 5000
-const DEFAULT_API_URL = 'https://api.openai.com/v1/chat/completions'
+const DEFAULT_API_URL = 'https://api.openai.com/v1'
 const DEFAULT_MAX_OUTPUT_TOKENS = 180
 const DEFAULT_TEMPERATURE = 1.1
+const EMOTION_TOOL_NAME = 'changeEmotion'
+const SYSTEM_ROLE_PROMPT =
+  '你是一个中文桌面吐槽助手。最终只输出一句中文吐槽成品，不要解释，不要编号，不要前后缀。'
 
 export type LlmErrorCode = 'MISSING_KEY' | 'TIMEOUT' | 'REQUEST_FAILED' | 'EMPTY_TEXT'
 
@@ -36,25 +42,6 @@ export class LlmError extends Error {
     this.code = code
   }
 }
-
-const OpenAIContentPartsSchema = z.array(
-  z.object({
-    type: z.literal('text'),
-    text: z.string().trim().min(1)
-  })
-)
-
-const OpenAIChatCompletionResponseSchema = z.object({
-  choices: z
-    .array(
-      z.object({
-        message: z.object({
-          content: z.union([z.string().trim().min(1), OpenAIContentPartsSchema.min(1)])
-        })
-      })
-    )
-    .min(1)
-})
 
 const UrlStringSchema = z.preprocess(
   (value) => (typeof value === 'string' ? value.trim() : value),
@@ -90,115 +77,145 @@ function parseEnvConfig(): LlmConfig {
   })
 }
 
-function resolveApiUrl(apiUrl: string): URL {
-  try {
-    return new URL(apiUrl)
-  } catch {
-    throw new LlmError('REQUEST_FAILED', `Invalid API URL: ${apiUrl}`)
-  }
+function resolveConfig(config: LlmConfig): LlmConfig {
+  const envConfig = parseEnvConfig()
+  return LlmConfigSchema.parse({ ...envConfig, ...config })
 }
 
-function buildRequestBody(
-  prompt: string,
-  model: string,
-  image: LlmImagePart | undefined,
-  maxOutputTokens: number,
-  temperature: number
-): Record<string, unknown> {
-  const content = image
-    ? [
-        { type: 'text', text: prompt },
+function normalizeBaseUrl(apiUrl: string): string {
+  const trimmed = apiUrl.trim()
+  return trimmed.replace(/\/chat\/completions\/?$/i, '')
+}
+
+function isDebugEnabled(): boolean {
+  const value = process.env.DEBUG_LLM?.trim().toLowerCase()
+  return value === '1' || value === 'true' || value === 'yes'
+}
+
+function debugToolStep(step: {
+  stepNumber: number
+  finishReason: string
+  toolCalls: ReadonlyArray<{
+    toolName: string
+    toolCallId: string
+    dynamic?: boolean
+  }>
+  toolResults: ReadonlyArray<{
+    toolName: string
+    toolCallId: string
+    providerExecuted?: boolean
+    dynamic?: boolean
+  }>
+}): void {
+  if (!isDebugEnabled()) {
+    return
+  }
+  if (step.toolCalls.length === 0 && step.toolResults.length === 0) {
+    return
+  }
+
+  console.log('[llm:function-call]', {
+    stepNumber: step.stepNumber,
+    finishReason: step.finishReason,
+    toolCalls: step.toolCalls.map((call) => ({
+      toolName: call.toolName,
+      toolCallId: call.toolCallId,
+      dynamic: Boolean(call.dynamic)
+    })),
+    toolResults: step.toolResults.map((result) => ({
+      toolName: result.toolName,
+      toolCallId: result.toolCallId,
+      providerExecuted: Boolean(result.providerExecuted),
+      dynamic: Boolean(result.dynamic)
+    }))
+  })
+}
+
+function buildMessages(request: LlmRoastRequest): ModelMessage[] {
+  if (!request.image) {
+    return [{ role: 'user', content: request.prompt }]
+  }
+
+  return [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: request.prompt },
         {
-          type: 'image_url',
-          image_url: { url: `data:${image.mimeType};base64,${image.dataBase64}` }
+          type: 'image',
+          image: request.image.dataBase64,
+          mediaType: request.image.mimeType
         }
       ]
-    : prompt
-
-  return {
-    model,
-    messages: [{ role: 'user', content }],
-    stream: false,
-    max_tokens: maxOutputTokens,
-    temperature
-  }
+    }
+  ]
 }
 
-function serializeErrorBody(payload: string): string {
-  return payload.slice(0, 200)
+export function hasLlmApiKey(config?: Partial<LlmConfig>): boolean {
+  const key = config?.apiKey?.trim() || process.env.LLM_API_KEY?.trim()
+  return Boolean(key)
 }
 
-function extractTextFromResponse(payload: string): string {
-  let parsedJson: unknown
-  try {
-    parsedJson = JSON.parse(payload)
-  } catch {
-    throw new LlmError('REQUEST_FAILED', 'LLM returned invalid JSON payload')
-  }
-
-  const parsed = OpenAIChatCompletionResponseSchema.safeParse(parsedJson)
-  if (!parsed.success) {
-    throw new LlmError('EMPTY_TEXT', 'OpenAI response did not match expected schema')
-  }
-
-  const choice = parsed.data.choices[0]
-  const content = choice.message.content
-  return typeof content === 'string' ? content.trim() : content[0].text.trim()
-}
-
-export async function generateLlmRoast(request: LlmRoastRequest, config: LlmConfig): Promise<string> {
-  const envConfig = parseEnvConfig()
-  const resolvedConfig = LlmConfigSchema.parse({ ...envConfig, ...config })
-  const apiKey = resolvedConfig.apiKey
-  if (!apiKey) {
+export function streamLlmRoast(request: LlmRoastRequest, config: LlmConfig) {
+  const resolvedConfig = resolveConfig(config)
+  if (!hasLlmApiKey(resolvedConfig)) {
     throw new LlmError('MISSING_KEY', 'LLM API key is missing')
-  }
-
-  const { model, timeoutMs, maxOutputTokens, temperature } = resolvedConfig
-  const endpoint = resolveApiUrl(resolvedConfig.apiUrl)
-
-  const body = buildRequestBody(request.prompt, model, request.image, maxOutputTokens, temperature)
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`
   }
 
   const controller = new AbortController()
   const timer = setTimeout(() => {
     controller.abort()
-  }, timeoutMs)
+  }, resolvedConfig.timeoutMs)
 
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal
+    const provider = createOpenAI({
+      baseURL: normalizeBaseUrl(resolvedConfig.apiUrl || process.env.LLM_API_URL || DEFAULT_API_URL),
+      apiKey: resolvedConfig.apiKey
     })
 
-    const payload = await response.text()
-
-    if (!response.ok) {
-      throw new LlmError('REQUEST_FAILED', `LLM HTTP ${response.status}: ${serializeErrorBody(payload)}`)
-    }
-
-    const text = extractTextFromResponse(payload)
-    if (!text) {
-      throw new LlmError('EMPTY_TEXT', 'LLM returned empty text')
-    }
-
-    return text
+    return streamText({
+      model: provider.chat(resolvedConfig.model || process.env.LLM_MODEL || DEFAULT_MODEL),
+      tools: banterTools,
+      system: SYSTEM_ROLE_PROMPT,
+      messages: buildMessages(request),
+      toolChoice: 'none',
+      prepareStep: ({ stepNumber }) => {
+        if (stepNumber === 0) {
+          return {
+            activeTools: [EMOTION_TOOL_NAME],
+            toolChoice: { type: 'tool', toolName: EMOTION_TOOL_NAME }
+          }
+        }
+        return {
+          activeTools: [],
+          toolChoice: 'none'
+        }
+      },
+      stopWhen: stepCountIs(2),
+      maxOutputTokens: resolvedConfig.maxOutputTokens,
+      temperature: resolvedConfig.temperature,
+      abortSignal: controller.signal,
+      onAbort: () => {
+        clearTimeout(timer)
+      },
+      onError: () => {
+        clearTimeout(timer)
+      },
+      onStepFinish: (step) => {
+        debugToolStep(step)
+      },
+      onFinish: () => {
+        clearTimeout(timer)
+      }
+    })
   } catch (error: unknown) {
+    clearTimeout(timer)
     if (error instanceof LlmError) {
       throw error
     }
-
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new LlmError('TIMEOUT', `LLM request timed out in ${timeoutMs}ms`)
+      throw new LlmError('TIMEOUT', `LLM request timed out in ${resolvedConfig.timeoutMs}ms`)
     }
-
     throw new LlmError('REQUEST_FAILED', `LLM request failed: ${String(error)}`)
-  } finally {
-    clearTimeout(timer)
   }
 }
