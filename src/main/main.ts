@@ -5,6 +5,10 @@ import { fileURLToPath } from 'node:url'
 import { registerHotkey, unregisterHotkeys } from './hotkeyHandler'
 import { loadEnvFiles } from './loadEnv'
 import { createOverlayWindow } from './windowManager'
+import { ProxyAgent, setGlobalDispatcher } from 'undici'
+
+const dispatcher = new ProxyAgent(process.env.HTTPS_PROXY || 'http://127.0.0.1:7897')
+setGlobalDispatcher(dispatcher)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(__dirname, '../..')

@@ -25,10 +25,25 @@ body {
   pointer-events: none;
 }
 
+.panel {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+}
+
+.avatar {
+  width: 84px;
+  height: 84px;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
 .bubble {
   background: rgba(28, 28, 30, 0.82);
   color: #ffffff;
-  width: 100%;
+  flex: 1;
   box-sizing: border-box;
   border-radius: 18px;
   padding: 18px 22px;

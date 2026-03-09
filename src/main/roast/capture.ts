@@ -1,30 +1,29 @@
-import { nativeImage, screen } from 'electron'
+import { desktopCapturer } from 'electron'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { z } from 'zod'
-import type { WindowBounds } from '../../shared/types'
+import type { WindowContext } from '../../shared/types'
 import { dataLoader } from '../dataLoader'
 import type { LlmImagePart } from './llmClient'
 
-const DEFAULT_MAX_SIDE = 960
 const DEFAULT_MAX_BYTES = 180_000
+const DEFAULT_MAX_SIDE = 960
 const MIN_SIDE = 320
 const DEFAULT_CODEC = 'jpeg'
 const DEFAULT_JPEG_QUALITY = 72
 const DEFAULT_DEBUG_CAPTURE_DIR = '.debug/roast-captures'
+const DEFAULT_CAPTURE_MODE: CaptureMode = 'foreground'
+const DEFAULT_THUMBNAIL_SIZE = { width: 1920, height: 1080 }
 
-type ScreenshotFn = (options?: Record<string, unknown>) => Promise<Buffer>
 type ImageCodec = 'png' | 'jpeg'
 type CaptureMode = 'foreground' | 'fullscreen'
 
 const CaptureConfigSchema = z
   .object({
-    captureMode: z.enum(['foreground', 'fullscreen']).catch('foreground'),
-    fallbackToFullscreen: z.boolean().catch(true)
+    captureMode: z.enum(['foreground', 'fullscreen']).catch(DEFAULT_CAPTURE_MODE)
   })
   .catch({
-    captureMode: 'foreground',
-    fallbackToFullscreen: true
+    captureMode: DEFAULT_CAPTURE_MODE
   })
 
 type CaptureConfig = z.infer<typeof CaptureConfigSchema>
@@ -127,30 +126,52 @@ async function dumpCaptureForDebug(buffer: Buffer, codec: ImageCodec): Promise<v
   }
 }
 
-async function loadScreenshotFn(): Promise<ScreenshotFn> {
-  const moduleValue = (await import('screenshot-desktop')) as unknown
-  const moduleAsRecord = moduleValue as Record<string, unknown>
-
-  if (typeof moduleAsRecord.default === 'function') {
-    return moduleAsRecord.default as ScreenshotFn
+function toAsciiSafeText(input: string): string {
+  let output = ''
+  for (const char of input) {
+    const code = char.codePointAt(0)
+    if (code === undefined) {
+      continue
+    }
+    if (code >= 0x20 && code <= 0x7e) {
+      output += char
+      continue
+    }
+    if (code <= 0xffff) {
+      output += `\\u${code.toString(16).padStart(4, '0')}`
+      continue
+    }
+    output += `\\u{${code.toString(16)}}`
   }
-  if (typeof moduleValue === 'function') {
-    return moduleValue as ScreenshotFn
-  }
-
-  throw new Error('Invalid screenshot-desktop module export')
+  return output
 }
 
-async function captureScreenBuffer(screenshot: ScreenshotFn, screenId?: string): Promise<Buffer> {
-  if (screenId) {
-    try {
-      return await screenshot({ format: 'png', screen: screenId })
-    } catch {
-      return screenshot({ format: 'png' })
-    }
-  }
+async function findWindowSource(windowId: number): Promise<Electron.DesktopCapturerSource | undefined> {
+  const sources = await desktopCapturer.getSources({
+    types: ['window'],
+    thumbnailSize: DEFAULT_THUMBNAIL_SIZE
+  })
 
-  return screenshot({ format: 'png' })
+  console.log(
+    '[capture] window sources',
+    sources.map((source) => ({
+      id: source.id,
+      name: toAsciiSafeText(source.name)
+    }))
+  )
+
+  const targetIdStr = String(windowId)
+  return sources.find(
+    (source) => source.id.includes(`:${targetIdStr}:`) || source.id.endsWith(`:${targetIdStr}`)
+  )
+}
+
+async function findScreenSource(): Promise<Electron.DesktopCapturerSource | undefined> {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: DEFAULT_THUMBNAIL_SIZE
+  })
+  return sources[0]
 }
 
 function clampDimensions(width: number, height: number, maxSide: number): { width: number; height: number } {
@@ -174,22 +195,21 @@ function encodeImage(image: Electron.NativeImage, codec: ImageCodec, jpegQuality
 }
 
 function optimizeImage(
-  buffer: Buffer,
+  input: Electron.NativeImage,
   maxSide: number,
   maxBytes: number,
   codec: ImageCodec,
   jpegQuality: number
 ): Buffer {
-  let image = nativeImage.createFromBuffer(buffer)
+  let image = input
   if (image.isEmpty()) {
-    return buffer
+    return Buffer.alloc(0)
   }
 
   let size = image.getSize()
   const clamped = clampDimensions(size.width, size.height, maxSide)
   if (clamped.width !== size.width || clamped.height !== size.height) {
     image = image.resize({ width: clamped.width, height: clamped.height, quality: 'good' })
-    size = image.getSize()
   }
 
   let output = encodeImage(image, codec, jpegQuality)
@@ -214,50 +234,7 @@ function optimizeImage(
   return output
 }
 
-function cropForegroundWindow(source: Buffer, bounds: WindowBounds): Buffer | undefined {
-  const image = nativeImage.createFromBuffer(source)
-  if (image.isEmpty()) {
-    return undefined
-  }
-
-  const imageSize = image.getSize()
-  if (imageSize.width <= 0 || imageSize.height <= 0) {
-    return undefined
-  }
-
-  const center = {
-    x: Math.round(bounds.x + bounds.width / 2),
-    y: Math.round(bounds.y + bounds.height / 2)
-  }
-
-  const display = screen.getDisplayNearestPoint(center)
-  const displayBounds = display.bounds
-
-  const scaleX = imageSize.width / Math.max(1, displayBounds.width)
-  const scaleY = imageSize.height / Math.max(1, displayBounds.height)
-
-  const rawX = Math.floor((bounds.x - displayBounds.x) * scaleX)
-  const rawY = Math.floor((bounds.y - displayBounds.y) * scaleY)
-  const rawWidth = Math.ceil(bounds.width * scaleX)
-  const rawHeight = Math.ceil(bounds.height * scaleY)
-
-  const x = Math.max(0, rawX)
-  const y = Math.max(0, rawY)
-  const width = Math.min(imageSize.width - x, rawWidth)
-  const height = Math.min(imageSize.height - y, rawHeight)
-
-  if (width <= 0 || height <= 0) {
-    return undefined
-  }
-
-  try {
-    return image.crop({ x, y, width, height }).toPNG()
-  } catch {
-    return undefined
-  }
-}
-
-export async function captureRoastImage(windowBounds?: WindowBounds | null): Promise<LlmImagePart | undefined> {
+export async function captureRoastImage(ctx?: WindowContext): Promise<LlmImagePart | undefined> {
   if (!isMultimodalEnabled()) {
     return undefined
   }
@@ -265,33 +242,40 @@ export async function captureRoastImage(windowBounds?: WindowBounds | null): Pro
   try {
     const config = getCaptureConfig()
     const captureMode = getCaptureMode(config)
-    const screenshot = await loadScreenshotFn()
 
-    const envScreenId = process.env.MULTIMODAL_SCREEN_ID?.trim() || undefined
-    const sourceBuffer = await captureScreenBuffer(screenshot, envScreenId)
+    let selectedImage: Electron.NativeImage | undefined
 
-    if (!Buffer.isBuffer(sourceBuffer) || sourceBuffer.length === 0) {
-      return undefined
+    if (captureMode === 'foreground' && typeof ctx?.id === 'number') {
+      const source = await findWindowSource(ctx.id)
+      if (source && !source.thumbnail.isEmpty()) {
+        selectedImage = source.thumbnail
+      }
     }
 
-    const foregroundBuffer =
-      captureMode === 'foreground' && windowBounds
-        ? cropForegroundWindow(sourceBuffer, windowBounds)
-        : undefined
+    if (!selectedImage || selectedImage.isEmpty() || captureMode === 'fullscreen') {
+      const screenSource = await findScreenSource()
+      if (!screenSource || screenSource.thumbnail.isEmpty()) {
+        return undefined
+      }
+      selectedImage = screenSource.thumbnail
+    }
 
-    const selectedBuffer = foregroundBuffer ?? (config.fallbackToFullscreen ? sourceBuffer : undefined)
-    if (!selectedBuffer) {
+    if (!selectedImage || selectedImage.isEmpty()) {
       return undefined
     }
 
     const codec = getImageCodec()
     const optimized = optimizeImage(
-      selectedBuffer,
+      selectedImage,
       getMaxSide(),
       getMaxBytes(),
       codec,
       getJpegQuality()
     )
+
+    if (optimized.length === 0) {
+      return undefined
+    }
 
     if (isCaptureDumpEnabled()) {
       try {

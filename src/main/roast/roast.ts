@@ -372,7 +372,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
   const flashConfig = buildFlashConfig(primaryConfig)
 
   try {
-    const image = await captureRoastImage(ctx?.bounds)
+    const image = await captureRoastImage(ctx)
     usedImage = Boolean(image)
     const primaryPrompt = buildRoastPrompt(ctx, style, { hasImage: usedImage })
 

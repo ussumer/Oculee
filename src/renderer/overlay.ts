@@ -3,17 +3,20 @@ type ToastShowPayload = { text: string }
 
 type OverlayApi = {
   onToastShow: (listener: (payload: ToastShowPayload) => void) => void
+  onAvatarChange: (listener: (emotion: string) => void) => void
   toastShow: (text: string) => void
 }
 
 type OverlayWindow = Window & { overlay?: OverlayApi }
 
 const bubble = document.getElementById('bubble')
+const avatarEl = document.getElementById('avatar') as HTMLImageElement | null
 const overlayWindow = window as OverlayWindow
 
 if (!bubble) {
   throw new Error('overlay bubble element not found')
 }
+const bubbleEl: HTMLElement = bubble
 
 let state: OverlayState = 'hidden'
 let hideTimer: ReturnType<typeof setTimeout> | null = null
@@ -28,8 +31,8 @@ function clearHideTimer(): void {
 
 function hideImmediately(): void {
   clearHideTimer()
-  bubble.classList.remove('is-visible', 'is-fading')
-  bubble.classList.add('is-hidden')
+  bubbleEl.classList.remove('is-visible', 'is-fading')
+  bubbleEl.classList.add('is-hidden')
   state = 'hidden'
 }
 
@@ -38,15 +41,15 @@ function startFade(): void {
     return
   }
 
-  bubble.classList.remove('is-visible', 'is-hidden')
-  bubble.classList.add('is-fading')
+  bubbleEl.classList.remove('is-visible', 'is-hidden')
+  bubbleEl.classList.add('is-fading')
   state = 'fading'
 }
 
 function show(text: string): void {
-  bubble.textContent = text
-  bubble.classList.remove('is-hidden', 'is-fading')
-  bubble.classList.add('is-visible')
+  bubbleEl.textContent = text
+  bubbleEl.classList.remove('is-hidden', 'is-fading')
+  bubbleEl.classList.add('is-visible')
   state = 'showing'
 
   clearHideTimer()
@@ -55,7 +58,7 @@ function show(text: string): void {
   }, 3000)
 }
 
-bubble.addEventListener('transitionend', (event: TransitionEvent) => {
+bubbleEl.addEventListener('transitionend', (event: TransitionEvent) => {
   if (event.propertyName !== 'opacity') {
     return
   }
@@ -80,6 +83,12 @@ function bindOverlayApi(retries = 40): void {
 
   overlayApi.onToastShow(({ text }) => {
     show(text)
+  })
+
+  overlayApi.onAvatarChange((emotion) => {
+    if (avatarEl) {
+      avatarEl.src = `/avatars/${emotion}.png?t=${Date.now()}`
+    }
   })
 }
 

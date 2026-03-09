@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import {
+  AVATAR_CHANGE_CHANNEL,
   TOAST_SHOW_CHANNEL,
   ToastShowPayloadSchema,
   type ToastShowPayload
@@ -31,6 +32,13 @@ contextBridge.exposeInMainWorld('overlay', {
     if (latestToastPayload) {
       listener(latestToastPayload)
     }
+  },
+  onAvatarChange(callback: (emotion: string) => void) {
+    ipcRenderer.on(AVATAR_CHANGE_CHANNEL, (_event, emotion: unknown) => {
+      if (typeof emotion === 'string') {
+        callback(emotion)
+      }
+    })
   },
   toastShow(text: string) {
     notifyToastListeners({ text })

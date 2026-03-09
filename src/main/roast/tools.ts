@@ -1,10 +1,11 @@
 import { tool } from 'ai'
 import { z } from 'zod'
 import { getOverlayWindow } from '../windowManager'
+import { AVATAR_CHANGE_CHANNEL } from '../../shared/ipc'
 
-const EmotionSchema = z.enum(['happy', 'sad', 'angry', 'smug'])
+const EmotionSchema = z.enum(['idle', 'happy', 'flustered', 'smug', 'sad'])
 const ChangeEmotionInputSchema = z.object({
-  emotion: EmotionSchema
+  emotion: EmotionSchema.describe('The target emotion to display.')
 })
 
 function isDebugEnabled(): boolean {
@@ -14,14 +15,13 @@ function isDebugEnabled(): boolean {
 
 export const banterTools = {
   changeEmotion: tool({
-    description:
-      '当你准备输出带明显情绪倾向的吐槽时调用此工具改变 Live2D 表情。示例: 挖苦/得意->smug, 开心夸张->happy, 不爽吐槽->angry, 无奈沮丧->sad。若文本情绪中性可不调用。',
+    description: 'Change the avatar emotion based on the tone of the roast.',
     inputSchema: ChangeEmotionInputSchema,
     async execute({ emotion }: z.infer<typeof ChangeEmotionInputSchema>) {
       const overlayWindow = getOverlayWindow()
       const hasOverlay = overlayWindow !== null && !overlayWindow.isDestroyed()
       if (overlayWindow && !overlayWindow.isDestroyed()) {
-        overlayWindow.webContents.send('live2d:change-emotion', emotion)
+        overlayWindow.webContents.send(AVATAR_CHANGE_CHANNEL, emotion)
       }
       if (isDebugEnabled()) {
         console.log('[llm:function-call:execute]', {
@@ -30,7 +30,7 @@ export const banterTools = {
           hasOverlay
         })
       }
-      return `Live2D emotion changed to ${emotion}`
+      return `[Emotion changed to ${emotion}]`
     }
   })
 }

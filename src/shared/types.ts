@@ -12,6 +12,7 @@ export const WindowBoundsSchema = z.object({
 })
 
 export const WindowContextSchema = z.object({
+  id: z.number().optional(),
   appName: z.string().nullable(),
   titleRaw: z.string().nullable(),
   titleSafe: z.string(),

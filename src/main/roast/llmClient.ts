@@ -10,7 +10,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 180
 const DEFAULT_TEMPERATURE = 1.1
 const EMOTION_TOOL_NAME = 'changeEmotion'
 const SYSTEM_ROLE_PROMPT =
-  '你是一个中文桌面吐槽助手。最终只输出一句中文吐槽成品，不要解释，不要编号，不要前后缀。'
+  '你是一个中文桌面吐槽助手。先调用一次 changeEmotion 工具设置头像情绪，再输出一句中文吐槽成品。不要解释，不要编号，不要前后缀。'
 
 export type LlmErrorCode = 'MISSING_KEY' | 'TIMEOUT' | 'REQUEST_FAILED' | 'EMPTY_TEXT'
 
@@ -178,7 +178,6 @@ export function streamLlmRoast(request: LlmRoastRequest, config: LlmConfig) {
       tools: banterTools,
       system: SYSTEM_ROLE_PROMPT,
       messages: buildMessages(request),
-      toolChoice: 'none',
       prepareStep: ({ stepNumber }) => {
         if (stepNumber === 0) {
           return {
