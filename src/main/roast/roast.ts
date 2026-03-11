@@ -7,7 +7,7 @@ import { codePointLength, trimAndClampByCodePoints } from '../../shared/utils/st
 import { z } from 'zod'
 import { getOverlayWindow } from '../windowManager'
 import { APICallError, AISDKError } from 'ai'
-import { TOAST_SHOW_CHANNEL, type ToastShowPayload } from '../../shared/ipc'
+import { TOAST_SHOW_CHANNEL, AVATAR_CHANGE_CHANNEL, type ToastShowPayload } from '../../shared/ipc'
 
 const MAX_TOAST_LENGTH = 100
 const MIN_TOAST_LENGTH = 8
@@ -18,8 +18,8 @@ const DEFAULT_TIMEOUT_MS = 5000
 const DEFAULT_API_URL = 'https://api.openai.com/v1'
 const DEFAULT_MAX_OUTPUT_TOKENS = 180
 const DEFAULT_TEMPERATURE = 1.1
-const STREAM_RENDER_CHARS_PER_TICK = 4
-const STREAM_RENDER_DELAY_MS = 20
+const STREAM_RENDER_CHARS_PER_TICK = 12
+const STREAM_RENDER_DELAY_MS = 0
 
 type RoastRoute = 'PRIMARY' | 'FLASH_API' | 'LOCAL_FALLBACK'
 type RoastReason = LlmErrorCode | 'UNKNOWN' | 'OK' | 'TOO_SHORT'
@@ -162,6 +162,12 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function appendToastChunkWithPacing(currentText: string, chunk: string): Promise<string> {
+  if (STREAM_RENDER_DELAY_MS <= 0) {
+    const nextText = currentText + chunk
+    pushToastText(nextText)
+    return nextText
+  }
+
   const parts = splitByCodePoints(chunk, STREAM_RENDER_CHARS_PER_TICK)
   let nextText = currentText
   for (let i = 0; i < parts.length; i += 1) {
@@ -186,6 +192,36 @@ interface StreamedRoastResult {
 function readPartString(part: StreamPart, key: string): string | undefined {
   const value = part[key]
   return typeof value === 'string' ? value : undefined
+}
+
+function readEmotionFromPayload(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+  const emotion = (value as Record<string, unknown>).emotion
+  if (typeof emotion !== 'string') {
+    return null
+  }
+  const normalized = emotion.trim()
+  return normalized || null
+}
+
+function readEmotionFromToolCallPart(part: StreamPart): string | null {
+  if (readPartString(part, 'toolName') !== 'changeEmotion') {
+    return null
+  }
+
+  const fromInput = readEmotionFromPayload(part.input)
+  if (fromInput) {
+    return fromInput
+  }
+
+  const fromArgs = readEmotionFromPayload(part.args)
+  if (fromArgs) {
+    return fromArgs
+  }
+
+  return null
 }
 
 function debugFullStreamEvent(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, part: StreamPart): void {
@@ -237,17 +273,37 @@ async function collectStreamedText(
   result: StreamedRoastResult
 ): Promise<string> {
   let text = ''
+  let pendingEmotion: string | null = null
+  let isFirstToken = true
   for await (const part of result.fullStream) {
     switch (part.type) {
       case 'text-delta': {
-        const chunk = readPartString(part, 'text')
+        if (isFirstToken) {
+          if (pendingEmotion) {
+            const win = getOverlayWindow()
+            if (win && !win.isDestroyed()) {
+              win.webContents.send(AVATAR_CHANGE_CHANNEL, pendingEmotion)
+            }
+            pendingEmotion = null
+          }
+          isFirstToken = false
+        }
+
+        const chunk = readPartString(part, 'textDelta') || readPartString(part, 'text')
         if (!chunk) {
           break
         }
         text = await appendToastChunkWithPacing(text, chunk)
         break
       }
-      case 'tool-call':
+      case 'tool-call': {
+        const emotion = readEmotionFromToolCallPart(part)
+        if (emotion) {
+          pendingEmotion = emotion
+        }
+        debugFullStreamEvent(route, part)
+        break
+      }
       case 'tool-result':
       case 'finish-step':
       case 'finish':
@@ -411,7 +467,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
       const flashPrompt = usedImage ? buildRoastPrompt(ctx, style, { hasImage: false }) : primaryPrompt
 
       try {
-        const flashResult = streamLlmRoast({ prompt: flashPrompt }, flashConfig)
+        const flashResult = streamLlmRoast({ prompt: flashPrompt, allowEmotionTool: false }, flashConfig)
         const flashText = await collectStreamedText('FLASH_API', flashResult)
 
         if (!flashText) {

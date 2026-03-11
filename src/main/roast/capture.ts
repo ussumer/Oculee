@@ -13,7 +13,7 @@ const DEFAULT_CODEC = 'jpeg'
 const DEFAULT_JPEG_QUALITY = 72
 const DEFAULT_DEBUG_CAPTURE_DIR = '.debug/roast-captures'
 const DEFAULT_CAPTURE_MODE: CaptureMode = 'foreground'
-const DEFAULT_THUMBNAIL_SIZE = { width: 1920, height: 1080 }
+const DEFAULT_THUMBNAIL_SIZE = { width: DEFAULT_MAX_SIDE, height: DEFAULT_MAX_SIDE }
 
 type ImageCodec = 'png' | 'jpeg'
 type CaptureMode = 'foreground' | 'fullscreen'
@@ -60,6 +60,10 @@ function isMultimodalEnabled(): boolean {
 
 function isCaptureDumpEnabled(): boolean {
   return parseBoolean(process.env.MULTIMODAL_DEBUG_DUMP, false)
+}
+
+function isDebugEnabled(): boolean {
+  return parseBoolean(process.env.DEBUG_LLM, false)
 }
 
 function getMaxSide(): number {
@@ -121,7 +125,7 @@ async function dumpCaptureForDebug(buffer: Buffer, codec: ImageCodec): Promise<v
   const file = join(dir, buildDebugCaptureFilename(codec))
   await mkdir(dir, { recursive: true })
   await writeFile(file, buffer)
-  if (parseBoolean(process.env.DEBUG_LLM, false)) {
+  if (isDebugEnabled()) {
     console.log('[capture] saved debug image', file)
   }
 }
@@ -149,16 +153,18 @@ function toAsciiSafeText(input: string): string {
 async function findWindowSource(windowId: number): Promise<Electron.DesktopCapturerSource | undefined> {
   const sources = await desktopCapturer.getSources({
     types: ['window'],
-    thumbnailSize: DEFAULT_THUMBNAIL_SIZE
+    thumbnailSize: getThumbnailSize()
   })
 
-  console.log(
-    '[capture] window sources',
-    sources.map((source) => ({
-      id: source.id,
-      name: toAsciiSafeText(source.name)
-    }))
-  )
+  if (isDebugEnabled()) {
+    console.log(
+      '[capture] window sources',
+      sources.map((source) => ({
+        id: source.id,
+        name: toAsciiSafeText(source.name)
+      }))
+    )
+  }
 
   const targetIdStr = String(windowId)
   return sources.find(
@@ -169,9 +175,17 @@ async function findWindowSource(windowId: number): Promise<Electron.DesktopCaptu
 async function findScreenSource(): Promise<Electron.DesktopCapturerSource | undefined> {
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
-    thumbnailSize: DEFAULT_THUMBNAIL_SIZE
+    thumbnailSize: getThumbnailSize()
   })
   return sources[0]
+}
+
+function getThumbnailSize(): { width: number; height: number } {
+  const side = Math.max(MIN_SIDE, getMaxSide())
+  return {
+    width: Math.min(DEFAULT_THUMBNAIL_SIZE.width, side),
+    height: Math.min(DEFAULT_THUMBNAIL_SIZE.height, side)
+  }
 }
 
 function clampDimensions(width: number, height: number, maxSide: number): { width: number; height: number } {

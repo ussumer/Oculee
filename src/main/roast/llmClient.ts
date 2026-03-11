@@ -11,6 +11,8 @@ const DEFAULT_TEMPERATURE = 1.1
 const EMOTION_TOOL_NAME = 'changeEmotion'
 const SYSTEM_ROLE_PROMPT =
   '你是一个中文桌面吐槽助手。先调用一次 changeEmotion 工具设置头像情绪，再输出一句中文吐槽成品。不要解释，不要编号，不要前后缀。'
+const SYSTEM_ROLE_PROMPT_TEXT_ONLY =
+  '你是一个中文桌面吐槽助手。直接输出一句中文吐槽成品。不要解释，不要编号，不要前后缀。'
 
 export type LlmErrorCode = 'MISSING_KEY' | 'TIMEOUT' | 'REQUEST_FAILED' | 'EMPTY_TEXT'
 
@@ -22,6 +24,7 @@ export interface LlmImagePart {
 export interface LlmRoastRequest {
   prompt: string
   image?: LlmImagePart
+  allowEmotionTool?: boolean
 }
 
 export interface LlmConfig {
@@ -161,6 +164,7 @@ export function streamLlmRoast(request: LlmRoastRequest, config: LlmConfig) {
   if (!hasLlmApiKey(resolvedConfig)) {
     throw new LlmError('MISSING_KEY', 'LLM API key is missing')
   }
+  const allowEmotionTool = request.allowEmotionTool !== false
 
   const controller = new AbortController()
   const timer = setTimeout(() => {
@@ -176,10 +180,10 @@ export function streamLlmRoast(request: LlmRoastRequest, config: LlmConfig) {
     return streamText({
       model: provider.chat(resolvedConfig.model || process.env.LLM_MODEL || DEFAULT_MODEL),
       tools: banterTools,
-      system: SYSTEM_ROLE_PROMPT,
+      system: allowEmotionTool ? SYSTEM_ROLE_PROMPT : SYSTEM_ROLE_PROMPT_TEXT_ONLY,
       messages: buildMessages(request),
       prepareStep: ({ stepNumber }) => {
-        if (stepNumber === 0) {
+        if (allowEmotionTool && stepNumber === 0) {
           return {
             activeTools: [EMOTION_TOOL_NAME],
             toolChoice: { type: 'tool', toolName: EMOTION_TOOL_NAME }
@@ -190,7 +194,7 @@ export function streamLlmRoast(request: LlmRoastRequest, config: LlmConfig) {
           toolChoice: 'none'
         }
       },
-      stopWhen: stepCountIs(2),
+      stopWhen: stepCountIs(allowEmotionTool ? 2 : 1),
       maxOutputTokens: resolvedConfig.maxOutputTokens,
       temperature: resolvedConfig.temperature,
       abortSignal: controller.signal,

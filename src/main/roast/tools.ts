@@ -1,7 +1,5 @@
 import { tool } from 'ai'
 import { z } from 'zod'
-import { getOverlayWindow } from '../windowManager'
-import { AVATAR_CHANGE_CHANNEL } from '../../shared/ipc'
 
 const EmotionSchema = z.enum(['idle', 'happy', 'flustered', 'smug', 'sad'])
 const ChangeEmotionInputSchema = z.object({
@@ -18,19 +16,13 @@ export const banterTools = {
     description: 'Change the avatar emotion based on the tone of the roast.',
     inputSchema: ChangeEmotionInputSchema,
     async execute({ emotion }: z.infer<typeof ChangeEmotionInputSchema>) {
-      const overlayWindow = getOverlayWindow()
-      const hasOverlay = overlayWindow !== null && !overlayWindow.isDestroyed()
-      if (overlayWindow && !overlayWindow.isDestroyed()) {
-        overlayWindow.webContents.send(AVATAR_CHANGE_CHANNEL, emotion)
-      }
       if (isDebugEnabled()) {
         console.log('[llm:function-call:execute]', {
           toolName: 'changeEmotion',
-          emotion,
-          hasOverlay
+          emotion
         })
       }
-      return `[Emotion changed to ${emotion}]`
+      return `[Emotion determined as ${emotion}]`
     }
   })
 }
