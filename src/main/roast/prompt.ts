@@ -1,9 +1,11 @@
 import { z } from 'zod'
-import type { WindowContext } from '../../shared/types'
+import type { MemoryContext } from '../memory/schema'
+import type { SanitizedWindowContext } from '../privacy/sanitize'
 import { dataLoader } from '../dataLoader'
 
 interface PromptOptions {
   hasImage?: boolean
+  memoryContext?: MemoryContext
 }
 
 const PromptsConfigSchema = z.object({
@@ -45,7 +47,7 @@ function normalizeTitle(value: string | null | undefined, config: PromptsConfig)
   return text || config.defaults.unknownTitle
 }
 
-function buildContextBlock(ctx: WindowContext | undefined, config: PromptsConfig): string {
+function buildContextBlock(ctx: SanitizedWindowContext | undefined, config: PromptsConfig): string {
   if (!ctx) {
     return [
       renderTemplate(config.contextLines.fallbackApp, {
@@ -58,7 +60,7 @@ function buildContextBlock(ctx: WindowContext | undefined, config: PromptsConfig
   }
 
   const appName = normalizeAppName(ctx.appName, config)
-  const title = normalizeTitle(ctx.titleRaw ?? ctx.titleSafe, config)
+  const title = normalizeTitle(ctx.titleSafe, config)
 
   return [
     renderTemplate(config.contextLines.app, { appName }),
@@ -66,18 +68,35 @@ function buildContextBlock(ctx: WindowContext | undefined, config: PromptsConfig
   ].join('\n')
 }
 
+function buildMemoryBlock(memoryContext: MemoryContext | undefined): string {
+  if (!memoryContext) {
+    return ''
+  }
+
+  const sections = [
+    ['Soul', memoryContext.soulText.trim()],
+    ['User', memoryContext.userProfileSummary.trim()],
+    ['Session', memoryContext.sessionSummary.trim()]
+  ]
+    .filter(([, value]) => Boolean(value))
+    .map(([label, value]) => `${label}:\n${value}`)
+
+  return sections.join('\n\n')
+}
+
 export function buildRoastPrompt(
-  ctx?: WindowContext,
+  ctx?: SanitizedWindowContext,
   style = 'default',
   options: PromptOptions = {}
 ): string {
   const config = getPromptsConfig()
+  const memoryBlock = buildMemoryBlock(options.memoryContext)
   const contextBlock = buildContextBlock(ctx, config)
   const imageHint = options.hasImage
     ? config.defaults.imageHintWithImage
     : config.defaults.imageHintWithoutImage
 
-  return config.promptLines
+  const promptBody = config.promptLines
     .map((line) =>
       renderTemplate(line, {
         style,
@@ -86,4 +105,6 @@ export function buildRoastPrompt(
       })
     )
     .join('\n')
+
+  return memoryBlock ? `${memoryBlock}\n\n${promptBody}` : promptBody
 }

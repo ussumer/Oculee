@@ -3,6 +3,12 @@ import type { WindowContext } from '../../shared/types'
 import { captureRoastImage } from './capture'
 import { LlmError, type LlmConfig, type LlmErrorCode, streamLlmRoast } from './llmClient'
 import { buildRoastPrompt } from './prompt'
+import { createEventId } from '../memory/eventId'
+import { appendInteractionLog } from '../memory/logWriter'
+import { prepareMemoryContext, updateCurrentSession } from '../memory/context'
+import type { InteractionEvent, InteractionRoute, SessionRoute } from '../memory/schema'
+import { formatLocalIsoTimestamp } from '../memory/time'
+import { sanitizeWindowContext, type SanitizedWindowContext } from '../privacy/sanitize'
 import { codePointLength, trimAndClampByCodePoints } from '../../shared/utils/stringUtils'
 import { z } from 'zod'
 import { getOverlayWindow } from '../windowManager'
@@ -20,6 +26,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 180
 const DEFAULT_TEMPERATURE = 1.1
 const STREAM_RENDER_CHARS_PER_TICK = 12
 const STREAM_RENDER_DELAY_MS = 0
+const REDACTED_LOG_TITLE = '[redacted]'
 
 type RoastRoute = 'PRIMARY' | 'FLASH_API' | 'LOCAL_FALLBACK'
 type RoastReason = LlmErrorCode | 'UNKNOWN' | 'OK' | 'TOO_SHORT'
@@ -189,6 +196,15 @@ interface StreamedRoastResult {
   fullStream: AsyncIterable<StreamPart>
 }
 
+interface CollectedStreamText {
+  text: string
+  emotion: string | null
+}
+
+function getElapsedMs(startTime: number): number {
+  return Date.now() - startTime
+}
+
 function readPartString(part: StreamPart, key: string): string | undefined {
   const value = part[key]
   return typeof value === 'string' ? value : undefined
@@ -224,7 +240,27 @@ function readEmotionFromToolCallPart(part: StreamPart): string | null {
   return null
 }
 
-function debugFullStreamEvent(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, part: StreamPart): void {
+function debugStreamTiming(
+  route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>,
+  event: string,
+  data: Record<string, unknown>
+): void {
+  if (!isDebugEnabled()) {
+    return
+  }
+
+  console.log('[roast:timing]', {
+    route,
+    event,
+    ...data
+  })
+}
+
+function debugFullStreamEvent(
+  route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>,
+  part: StreamPart,
+  elapsedMs?: number
+): void {
   if (!isDebugEnabled()) {
     return
   }
@@ -233,6 +269,7 @@ function debugFullStreamEvent(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, part
     console.log('[roast:stream]', {
       route,
       type: part.type,
+      elapsedMs,
       toolName: readPartString(part, 'toolName'),
       toolCallId: readPartString(part, 'toolCallId')
     })
@@ -243,6 +280,7 @@ function debugFullStreamEvent(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, part
     console.log('[roast:stream]', {
       route,
       type: part.type,
+      elapsedMs,
       finishReason: readPartString(part, 'finishReason'),
       rawFinishReason: readPartString(part, 'rawFinishReason')
     })
@@ -270,14 +308,35 @@ function toStreamError(route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>, error: unkn
 
 async function collectStreamedText(
   route: Exclude<RoastRoute, 'LOCAL_FALLBACK'>,
-  result: StreamedRoastResult
-): Promise<string> {
+  result: StreamedRoastResult,
+  requestStartedAt: number
+): Promise<CollectedStreamText> {
   let text = ''
   let pendingEmotion: string | null = null
+  let lastEmotion: string | null = null
   let isFirstToken = true
+  let firstToolCallMs: number | null = null
+  let firstTextDeltaMs: number | null = null
+  let textChunkCount = 0
+  let textCharsTotal = 0
   for await (const part of result.fullStream) {
+    const elapsedMs = getElapsedMs(requestStartedAt)
     switch (part.type) {
       case 'text-delta': {
+        const chunk = readPartString(part, 'textDelta') || readPartString(part, 'text')
+        if (!chunk) {
+          break
+        }
+
+        if (firstTextDeltaMs === null) {
+          firstTextDeltaMs = elapsedMs
+          debugStreamTiming(route, 'first-text-delta', {
+            elapsedMs,
+            chunkChars: codePointLength(chunk),
+            hadPendingEmotion: Boolean(pendingEmotion)
+          })
+        }
+
         if (isFirstToken) {
           if (pendingEmotion) {
             const win = getOverlayWindow()
@@ -288,26 +347,32 @@ async function collectStreamedText(
           }
           isFirstToken = false
         }
-
-        const chunk = readPartString(part, 'textDelta') || readPartString(part, 'text')
-        if (!chunk) {
-          break
-        }
+        textChunkCount += 1
+        textCharsTotal += codePointLength(chunk)
         text = await appendToastChunkWithPacing(text, chunk)
         break
       }
       case 'tool-call': {
         const emotion = readEmotionFromToolCallPart(part)
+        if (firstToolCallMs === null) {
+          firstToolCallMs = elapsedMs
+          debugStreamTiming(route, 'first-tool-call', {
+            elapsedMs,
+            toolName: readPartString(part, 'toolName'),
+            emotion
+          })
+        }
         if (emotion) {
           pendingEmotion = emotion
+          lastEmotion = emotion
         }
-        debugFullStreamEvent(route, part)
+        debugFullStreamEvent(route, part, elapsedMs)
         break
       }
       case 'tool-result':
       case 'finish-step':
       case 'finish':
-        debugFullStreamEvent(route, part)
+        debugFullStreamEvent(route, part, elapsedMs)
         break
       case 'abort':
         throw new LlmError('TIMEOUT', `${route} stream aborted`)
@@ -317,7 +382,95 @@ async function collectStreamedText(
         break
     }
   }
-  return clampText(text)
+
+  debugStreamTiming(route, 'stream-complete', {
+    elapsedMs: getElapsedMs(requestStartedAt),
+    firstToolCallMs,
+    firstTextDeltaMs,
+    textChunkCount,
+    textCharsTotal,
+    outputChars: codePointLength(text)
+  })
+
+  return {
+    text: clampText(text),
+    emotion: lastEmotion
+  }
+}
+
+function toSessionSafeAppName(ctx: SanitizedWindowContext): string {
+  return ctx.isSensitive ? '敏感应用' : ctx.appName
+}
+
+function queueSessionUpdate(
+  ctx: SanitizedWindowContext,
+  route: SessionRoute,
+  lastEmotion: string | null,
+  lastHasImage: boolean
+): void {
+  void updateCurrentSession({
+    lastApp: toSessionSafeAppName(ctx),
+    lastTitleSafe: ctx.titleSafe,
+    lastRoute: route,
+    lastEmotion,
+    lastHasImage
+  }).catch((error: unknown) => {
+    if (!isDebugEnabled()) {
+      return
+    }
+    console.error('[memory] session update failed', error)
+  })
+}
+
+function toInteractionRoute(route: RoastRoute): InteractionRoute {
+  switch (route) {
+    case 'PRIMARY':
+      return 'primary'
+    case 'FLASH_API':
+      return 'flash'
+    case 'LOCAL_FALLBACK':
+      return 'local'
+  }
+}
+
+function buildInteractionEvent(
+  ctx: SanitizedWindowContext,
+  route: RoastRoute,
+  roastText: string,
+  lastEmotion: string | null,
+  hasImage: boolean
+): InteractionEvent {
+  const blockedByPrivacy = ctx.isSensitive
+  const safeAppName = toSessionSafeAppName(ctx)
+
+  return {
+    id: createEventId(),
+    timestamp: formatLocalIsoTimestamp(),
+    source: { kind: 'roast' },
+    appName: safeAppName,
+    titleSafe: blockedByPrivacy ? REDACTED_LOG_TITLE : ctx.titleSafe,
+    route: toInteractionRoute(route),
+    emotion: blockedByPrivacy ? undefined : lastEmotion ?? undefined,
+    hasImage: blockedByPrivacy ? false : hasImage,
+    usedFallback: route !== 'PRIMARY',
+    blockedByPrivacy,
+    roastText: blockedByPrivacy ? '' : roastText,
+    sessionSnapshot: {
+      lastApp: safeAppName,
+      lastRoute: route,
+      lastEmotion: blockedByPrivacy ? undefined : lastEmotion ?? undefined
+    }
+  }
+}
+
+function queueInteractionLog(
+  ctx: SanitizedWindowContext,
+  route: RoastRoute,
+  roastText: string,
+  lastEmotion: string | null,
+  hasImage: boolean
+): void {
+  void appendInteractionLog(buildInteractionEvent(ctx, route, roastText, lastEmotion, hasImage))
 }
 
 function debugLog(data: {
@@ -430,11 +583,26 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
   try {
     const image = await captureRoastImage(ctx)
     usedImage = Boolean(image)
-    const primaryPrompt = buildRoastPrompt(ctx, style, { hasImage: usedImage })
+    const sanitizedCtx = sanitizeWindowContext(ctx)
+    const memoryContext = await prepareMemoryContext()
+    const primaryPrompt = buildRoastPrompt(sanitizedCtx, style, {
+      hasImage: usedImage,
+      memoryContext
+    })
+    const primaryRequestStartedAt = Date.now()
+
+    debugStreamTiming('PRIMARY', 'request-start', {
+      elapsedMs: 0,
+      hasImage: usedImage,
+      promptChars: codePointLength(primaryPrompt),
+      timeoutMs: primaryConfig.timeoutMs,
+      model: primaryConfig.model
+    })
 
     try {
       const primaryResult = streamLlmRoast({ prompt: primaryPrompt, image }, primaryConfig)
-      const primaryText = await collectStreamedText('PRIMARY', primaryResult)
+      const primaryOutput = await collectStreamedText('PRIMARY', primaryResult, primaryRequestStartedAt)
+      const primaryText = primaryOutput.text
 
       if (!primaryText) {
         throw new LlmError('EMPTY_TEXT', 'PRIMARY text empty after stream')
@@ -442,6 +610,8 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
       if (textLength(primaryText) < MIN_TOAST_LENGTH) {
         primaryReason = 'TOO_SHORT'
         const fallback = getFallbackText(ctx, style)
+        queueSessionUpdate(sanitizedCtx, 'LOCAL_FALLBACK', null, false)
+        queueInteractionLog(sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
         logResult('TOO_SHORT', ctx, startedAt, {
           route: 'LOCAL_FALLBACK',
           usedFallback: true,
@@ -453,6 +623,8 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
       }
 
       primaryReason = 'OK'
+      queueSessionUpdate(sanitizedCtx, 'PRIMARY', primaryOutput.emotion, usedImage)
+      queueInteractionLog(sanitizedCtx, 'PRIMARY', primaryText, primaryOutput.emotion, usedImage)
       logResult('OK', ctx, startedAt, {
         route: 'PRIMARY',
         usedFallback: false,
@@ -464,11 +636,23 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
     } catch (primaryError: unknown) {
       debugRouteError('PRIMARY', primaryError)
       primaryReason = toErrorCode(primaryError)
-      const flashPrompt = usedImage ? buildRoastPrompt(ctx, style, { hasImage: false }) : primaryPrompt
+      const flashPrompt = usedImage
+        ? buildRoastPrompt(sanitizedCtx, style, { hasImage: false, memoryContext })
+        : primaryPrompt
+      const flashRequestStartedAt = Date.now()
+
+      debugStreamTiming('FLASH_API', 'request-start', {
+        elapsedMs: 0,
+        hasImage: false,
+        promptChars: codePointLength(flashPrompt),
+        timeoutMs: flashConfig.timeoutMs,
+        model: flashConfig.model
+      })
 
       try {
         const flashResult = streamLlmRoast({ prompt: flashPrompt, allowEmotionTool: false }, flashConfig)
-        const flashText = await collectStreamedText('FLASH_API', flashResult)
+        const flashOutput = await collectStreamedText('FLASH_API', flashResult, flashRequestStartedAt)
+        const flashText = flashOutput.text
 
         if (!flashText) {
           throw new LlmError('EMPTY_TEXT', 'FLASH_API text empty after stream')
@@ -476,6 +660,8 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
         if (textLength(flashText) < MIN_TOAST_LENGTH) {
           flashReason = 'TOO_SHORT'
           const fallback = getFallbackText(ctx, style)
+          queueSessionUpdate(sanitizedCtx, 'LOCAL_FALLBACK', null, false)
+          queueInteractionLog(sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
           logResult('TOO_SHORT', ctx, startedAt, {
             route: 'LOCAL_FALLBACK',
             usedFallback: true,
@@ -487,6 +673,8 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
         }
 
         flashReason = 'OK'
+        queueSessionUpdate(sanitizedCtx, 'FLASH_API', flashOutput.emotion, false)
+        queueInteractionLog(sanitizedCtx, 'FLASH_API', flashText, flashOutput.emotion, false)
         logResult('OK', ctx, startedAt, {
           route: 'FLASH_API',
           usedFallback: false,
@@ -506,6 +694,9 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
     maybeQueueMissingKeyNotice(reason)
 
     const fallback = getFallbackText(ctx, style)
+    const sanitizedCtx = sanitizeWindowContext(ctx)
+    queueSessionUpdate(sanitizedCtx, 'LOCAL_FALLBACK', null, false)
+    queueInteractionLog(sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
 
     logResult(reason, ctx, startedAt, {
       route: 'LOCAL_FALLBACK',

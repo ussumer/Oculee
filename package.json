@@ -8,12 +8,14 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "preview": "electron-vite preview"
+    "preview": "electron-vite preview",
+    "test": "node --import tsx --test src/test/memory-paths.test.ts src/test/sanitize.test.ts src/test/prompt.test.ts src/test/memory-bootstrap.test.ts src/test/memory-context.test.ts src/test/session-current.test.ts src/test/log-writer.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.13.4",
     "electron": "^34.3.0",
     "electron-vite": "^2.3.0",
+    "tsx": "^4.20.5",
     "typescript": "^5.7.3"
   },
   "dependencies": {

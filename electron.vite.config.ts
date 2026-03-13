@@ -3,12 +3,22 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 
 export default defineConfig({
   main: {
-    entry: 'src/main/main.ts',
+    build: {
+      rollupOptions: {
+        input: {
+          main: resolve(process.cwd(), 'src/main/main.ts')
+        }
+      }
+    },
     plugins: [externalizeDepsPlugin()]
   },
   preload: {
-    input: {
-      preload: resolve(process.cwd(), 'src/preload/preload.ts')
+    build: {
+      rollupOptions: {
+        input: {
+          preload: resolve(process.cwd(), 'src/preload/preload.ts')
+        }
+      }
     },
     plugins: [externalizeDepsPlugin()]
   },
