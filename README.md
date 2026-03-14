@@ -1,7 +1,7 @@
-# Desktop Banter Bot (Electron, Windows Only)
+# Oculee
 
-桌面透明 Overlay 吐槽助手，主进程基于 Electron + TypeScript。
-当前主链路已升级为：
+Oculee 是一个 Electron + TypeScript 的桌面吐槽助手。
+当前主链路保持为：
 
 - 全局热键触发：`Ctrl+Alt+T`
 - 5 秒冷却 + 运行中防重入
@@ -9,6 +9,9 @@
 - 多模态截图（`desktopCapturer`）
 - LLM 双路由高可用：`PRIMARY -> FLASH_API(纯文本) -> LOCAL_FALLBACK`
 - AI SDK 流式消费 + Function Calling（`changeEmotion`）
+- 静态头像表情切换（`avatar:change`）
+- 仓库内 memory 目录：`.oculee-memory/`
+- append-only interaction log：`.oculee-memory/logs/YYYY/MM/DD.jsonl`
 
 ## Requirements
 
@@ -30,6 +33,12 @@ pnpm dev
 
 ```powershell
 pnpm build
+```
+
+运行测试：
+
+```powershell
+pnpm test
 ```
 
 ## Environment Variables
@@ -87,18 +96,21 @@ pnpm build
 1. 热键触发后先检查冷却和 in-flight（防重入）。
 2. 读取前台窗口上下文（`appName/title/bounds/id`）。
 3. 按配置尝试截图。
-4. 构造 prompt 并调用 Primary（可带图）。
-5. Primary 失败后，剥离图片，使用 Flash 纯文本重试。
-6. Flash 失败后，回退本地 `roastLocal`。
-7. 首次缺 key 会额外提示一次：`未配置KEY，使用本地吐槽`。
+4. 读取 memory 上下文（`soul/user/session`）。
+5. 构造 prompt 并调用 Primary（可带图）。
+6. Primary 失败后，剥离图片，使用 Flash 纯文本重试。
+7. Flash 失败后，回退本地 `roastLocal`。
+8. roast 完成后异步更新 `session/current.json`，并追加 interaction log。
+9. 首次缺 key 会额外提示一次：`未配置KEY，使用本地吐槽`。
 
 ## AI SDK / Function Calling
 
 - LLM 调用使用 `@ai-sdk/openai` + `streamText`。
 - 主流程消费 `fullStream`，逐块推送 toast 文本。
 - 工具定义在 `src/main/roast/tools.ts`，当前包含：
-  - `changeEmotion(emotion: 'happy' | 'sad' | 'angry' | 'smug')`
-- 工具执行时会向 Overlay 窗口发送：`live2d:change-emotion`。
+  - `changeEmotion(emotion: 'idle' | 'happy' | 'flustered' | 'smug' | 'sad')`
+- 工具本身只负责返回结构化结果；实际头像切换在流式消费阶段触发。
+- 头像通道：`avatar:change`
 
 ## Capture Design (DPI-safe)
 
@@ -109,18 +121,36 @@ pnpm build
 - foreground 未命中时自动回退 `screen` 源
 - 图片统一压缩/缩放后转 Base64 传给模型
 
+## Memory Layout
+
+- memory 根目录：`.oculee-memory/`
+- canonical files：
+  - `.oculee-memory/soul.md`
+  - `.oculee-memory/user.md`
+  - `.oculee-memory/session/current.json`
+- interaction logs：
+  - `.oculee-memory/logs/YYYY/MM/DD.jsonl`
+
+说明：
+
+- `soul.md` / `user.md` 只在缺失时 bootstrap，不会自动覆盖你的手改内容。
+- `session/current.json` 是短期状态，不是长期画像。
+- interaction log 只做 append-only 安全事件记录，不做 retrieval / reflection / archive。
+
 ## Project Structure
 
 - `src/main/main.ts`：应用启动编排（load env / window / hotkey）
 - `src/main/hotkeyHandler.ts`：热键、冷却、防重入、主调用入口
 - `src/main/activeWindow.ts`：前台窗口采集与 Zod 清洗
+- `src/main/privacy/sanitize.ts`：安全标题与敏感窗口裁剪
+- `src/main/memory/*.ts`：memory 路径、bootstrap、session、append-only logs
 - `src/main/roast/roast.ts`：编排层（Primary/Flash/Local 路由 + 日志）
 - `src/main/roast/llmClient.ts`：AI SDK 客户端与 stream 配置
 - `src/main/roast/capture.ts`：截图、压缩、debug dump
 - `src/main/roast/tools.ts`：Function Calling 工具定义
 - `src/main/assets/*.json`：prompt/roast/capture 配置
 - `src/preload/preload.ts`：IPC 网关
-- `src/renderer/overlay.ts`：toast 展示状态机
+- `src/renderer/overlay.ts`：toast 与头像状态同步
 
 ## Troubleshooting
 
@@ -128,8 +158,12 @@ pnpm build
 - 一直走 `LOCAL_FALLBACK`：打开 `DEBUG_LLM=1`，看 `[roast:error]` 的 `route/reason`。
 - 报 `PRIMARY/FLASH text empty after stream`：通常是模型只返回 tool step 或空文本，检查模型兼容性与工具策略。
 - 报 `Failed to start capture: -2147024809`：这是 Windows 图形捕获启动失败，先切 `MULTIMODAL_CAPTURE_MODE=fullscreen` 验证链路。
+- 如果日志时间看起来不是北京时间：新写入的 memory 时间现在是本地 offset ISO，例如 `2026-03-14T00:29:31.512+08:00`；旧日志可能还是 `Z` 结尾的 UTC。
 
 ## Notes
 
 - `.env` 和 `.env.local` 会自动加载；系统环境变量优先级最高。
-- 本项目运行时目前只消费 `toast:show` 通道；流式效果通过重复发送更新后的完整文本实现。
+- Overlay 当前消费的关键 IPC 通道是：
+  - `toast:show`
+  - `avatar:change`
+- 流式效果通过重复发送更新后的完整文本实现。
