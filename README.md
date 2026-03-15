@@ -84,8 +84,6 @@ pnpm test
 - `MULTIMODAL_IMAGE_MAX_BYTES`：默认 `180000`
 - `MULTIMODAL_IMAGE_CODEC`：`jpeg`（默认）/ `png`
 - `MULTIMODAL_JPEG_QUALITY`：默认 `72`
-- `MULTIMODAL_DEBUG_DUMP`：`1/true` 时保存发送给 LLM 的压缩图
-- `MULTIMODAL_DEBUG_DUMP_DIR`：debug 图输出目录（默认 `.debug/roast-captures`）
 
 ### Debug
 

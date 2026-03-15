@@ -8,11 +8,10 @@ const DEFAULT_TIMEOUT_MS = 5000
 const DEFAULT_API_URL = 'https://api.openai.com/v1'
 const DEFAULT_MAX_OUTPUT_TOKENS = 180
 const DEFAULT_TEMPERATURE = 1.1
-const EMOTION_TOOL_NAME = 'changeEmotion'
 const SYSTEM_ROLE_PROMPT =
-  '你是一个中文桌面吐槽助手。先调用一次 changeEmotion 工具设置头像情绪，再输出一句中文吐槽成品。不要解释，不要编号，不要前后缀。'
+  '你是一个中文桌面吐槽助手。你的回复必须严格以情绪标签开头。标签用方括号包裹，支持枚举：[idle], [happy], [smug], [sad], [flustered]。例："[smug]又写这种代码？" 标签前不可有空格。只输出一句中文吐槽成品。不要解释，不要编号，不要前后缀。'
 const SYSTEM_ROLE_PROMPT_TEXT_ONLY =
-  '你是一个中文桌面吐槽助手。直接输出一句中文吐槽成品。不要解释，不要编号，不要前后缀。'
+  SYSTEM_ROLE_PROMPT
 
 export type LlmErrorCode = 'MISSING_KEY' | 'TIMEOUT' | 'REQUEST_FAILED' | 'EMPTY_TEXT'
 
@@ -182,18 +181,6 @@ export function streamLlmRoast(request: LlmRoastRequest, config: LlmConfig) {
       tools: banterTools,
       system: allowEmotionTool ? SYSTEM_ROLE_PROMPT : SYSTEM_ROLE_PROMPT_TEXT_ONLY,
       messages: buildMessages(request),
-      prepareStep: ({ stepNumber }) => {
-        if (allowEmotionTool && stepNumber === 0) {
-          return {
-            activeTools: [EMOTION_TOOL_NAME],
-            toolChoice: { type: 'tool', toolName: EMOTION_TOOL_NAME }
-          }
-        }
-        return {
-          activeTools: [],
-          toolChoice: 'none'
-        }
-      },
       stopWhen: stepCountIs(allowEmotionTool ? 2 : 1),
       maxOutputTokens: resolvedConfig.maxOutputTokens,
       temperature: resolvedConfig.temperature,

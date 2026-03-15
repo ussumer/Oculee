@@ -3,6 +3,7 @@ import type { WindowContext } from '../../shared/types'
 import { captureRoastImage } from './capture'
 import { LlmError, type LlmConfig, type LlmErrorCode, streamLlmRoast } from './llmClient'
 import { buildRoastPrompt } from './prompt'
+import { saveMemoryCapture } from '../memory/captureWriter'
 import { createEventId } from '../memory/eventId'
 import { appendInteractionLog } from '../memory/logWriter'
 import { prepareMemoryContext, updateCurrentSession } from '../memory/context'
@@ -27,6 +28,7 @@ const DEFAULT_TEMPERATURE = 1.1
 const STREAM_RENDER_CHARS_PER_TICK = 12
 const STREAM_RENDER_DELAY_MS = 0
 const REDACTED_LOG_TITLE = '[redacted]'
+const EMOTION_TAG_REGEX = /^\[(idle|happy|angry|smug|sad|flustered)\]/i
 
 type RoastRoute = 'PRIMARY' | 'FLASH_API' | 'LOCAL_FALLBACK'
 type RoastReason = LlmErrorCode | 'UNKNOWN' | 'OK' | 'TOO_SHORT'
@@ -201,6 +203,12 @@ interface CollectedStreamText {
   emotion: string | null
 }
 
+interface InteractionLogSeed {
+  eventId: string
+  timestamp: string
+  imagePathPromise?: Promise<string | undefined>
+}
+
 function getElapsedMs(startTime: number): number {
   return Date.now() - startTime
 }
@@ -210,34 +218,12 @@ function readPartString(part: StreamPart, key: string): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
-function readEmotionFromPayload(value: unknown): string | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return null
+function pushAvatarEmotion(emotion: string): void {
+  const win = getOverlayWindow()
+  if (!win || win.isDestroyed()) {
+    return
   }
-  const emotion = (value as Record<string, unknown>).emotion
-  if (typeof emotion !== 'string') {
-    return null
-  }
-  const normalized = emotion.trim()
-  return normalized || null
-}
-
-function readEmotionFromToolCallPart(part: StreamPart): string | null {
-  if (readPartString(part, 'toolName') !== 'changeEmotion') {
-    return null
-  }
-
-  const fromInput = readEmotionFromPayload(part.input)
-  if (fromInput) {
-    return fromInput
-  }
-
-  const fromArgs = readEmotionFromPayload(part.args)
-  if (fromArgs) {
-    return fromArgs
-  }
-
-  return null
+  win.webContents.send(AVATAR_CHANGE_CHANNEL, emotion)
 }
 
 function debugStreamTiming(
@@ -312,13 +298,13 @@ async function collectStreamedText(
   requestStartedAt: number
 ): Promise<CollectedStreamText> {
   let text = ''
-  let pendingEmotion: string | null = null
   let lastEmotion: string | null = null
-  let isFirstToken = true
   let firstToolCallMs: number | null = null
   let firstTextDeltaMs: number | null = null
   let textChunkCount = 0
   let textCharsTotal = 0
+  let hasExtractedEmotion = false
+  let rawTextBuffer = ''
   for await (const part of result.fullStream) {
     const elapsedMs = getElapsedMs(requestStartedAt)
     switch (part.type) {
@@ -332,39 +318,48 @@ async function collectStreamedText(
           firstTextDeltaMs = elapsedMs
           debugStreamTiming(route, 'first-text-delta', {
             elapsedMs,
-            chunkChars: codePointLength(chunk),
-            hadPendingEmotion: Boolean(pendingEmotion)
+            chunkChars: codePointLength(chunk)
           })
         }
 
-        if (isFirstToken) {
-          if (pendingEmotion) {
-            const win = getOverlayWindow()
-            if (win && !win.isDestroyed()) {
-              win.webContents.send(AVATAR_CHANGE_CHANNEL, pendingEmotion)
+        if (!hasExtractedEmotion) {
+          rawTextBuffer += chunk
+          const match = rawTextBuffer.match(EMOTION_TAG_REGEX)
+
+          if (match) {
+            const emotion = match[1].toLowerCase()
+            pushAvatarEmotion(emotion)
+            lastEmotion = emotion
+            hasExtractedEmotion = true
+
+            const cleanText = rawTextBuffer.replace(match[0], '').trimStart()
+            rawTextBuffer = ''
+            if (cleanText) {
+              textChunkCount += 1
+              textCharsTotal += codePointLength(cleanText)
+              text = await appendToastChunkWithPacing(text, cleanText)
             }
-            pendingEmotion = null
+          } else if (rawTextBuffer.length > 20 && !rawTextBuffer.includes('[')) {
+            hasExtractedEmotion = true
+            textChunkCount += 1
+            textCharsTotal += codePointLength(rawTextBuffer)
+            text = await appendToastChunkWithPacing(text, rawTextBuffer)
+            rawTextBuffer = ''
           }
-          isFirstToken = false
+        } else {
+          textChunkCount += 1
+          textCharsTotal += codePointLength(chunk)
+          text = await appendToastChunkWithPacing(text, chunk)
         }
-        textChunkCount += 1
-        textCharsTotal += codePointLength(chunk)
-        text = await appendToastChunkWithPacing(text, chunk)
         break
       }
       case 'tool-call': {
-        const emotion = readEmotionFromToolCallPart(part)
         if (firstToolCallMs === null) {
           firstToolCallMs = elapsedMs
           debugStreamTiming(route, 'first-tool-call', {
             elapsedMs,
-            toolName: readPartString(part, 'toolName'),
-            emotion
+            toolName: readPartString(part, 'toolName')
           })
-        }
-        if (emotion) {
-          pendingEmotion = emotion
-          lastEmotion = emotion
         }
         debugFullStreamEvent(route, part, elapsedMs)
         break
@@ -380,6 +375,25 @@ async function collectStreamedText(
         throw toStreamError(route, part.error)
       default:
         break
+    }
+  }
+
+  if (!hasExtractedEmotion && rawTextBuffer) {
+    const match = rawTextBuffer.match(EMOTION_TAG_REGEX)
+    if (match) {
+      const emotion = match[1].toLowerCase()
+      pushAvatarEmotion(emotion)
+      lastEmotion = emotion
+      const cleanText = rawTextBuffer.replace(match[0], '').trimStart()
+      if (cleanText) {
+        textChunkCount += 1
+        textCharsTotal += codePointLength(cleanText)
+        text = await appendToastChunkWithPacing(text, cleanText)
+      }
+    } else {
+      textChunkCount += 1
+      textCharsTotal += codePointLength(rawTextBuffer)
+      text = await appendToastChunkWithPacing(text, rawTextBuffer)
     }
   }
 
@@ -434,23 +448,26 @@ function toInteractionRoute(route: RoastRoute): InteractionRoute {
 }
 
 function buildInteractionEvent(
+  seed: InteractionLogSeed,
   ctx: SanitizedWindowContext,
   route: RoastRoute,
   roastText: string,
   lastEmotion: string | null,
-  hasImage: boolean
+  hasImage: boolean,
+  imagePath?: string
 ): InteractionEvent {
   const blockedByPrivacy = ctx.isSensitive
   const safeAppName = toSessionSafeAppName(ctx)
 
   return {
-    id: createEventId(),
-    timestamp: formatLocalIsoTimestamp(),
+    id: seed.eventId,
+    timestamp: seed.timestamp,
     source: { kind: 'roast' },
     appName: safeAppName,
     titleSafe: blockedByPrivacy ? REDACTED_LOG_TITLE : ctx.titleSafe,
     route: toInteractionRoute(route),
     emotion: blockedByPrivacy ? undefined : lastEmotion ?? undefined,
+    imagePath: blockedByPrivacy ? undefined : imagePath,
     hasImage: blockedByPrivacy ? false : hasImage,
     usedFallback: route !== 'PRIMARY',
     blockedByPrivacy,
@@ -464,13 +481,17 @@ function buildInteractionEvent(
 }
 
 function queueInteractionLog(
+  seed: InteractionLogSeed,
   ctx: SanitizedWindowContext,
   route: RoastRoute,
   roastText: string,
   lastEmotion: string | null,
   hasImage: boolean
 ): void {
-  void appendInteractionLog(buildInteractionEvent(ctx, route, roastText, lastEmotion, hasImage))
+  void (async () => {
+    const imagePath = ctx.isSensitive ? undefined : await seed.imagePathPromise
+    await appendInteractionLog(buildInteractionEvent(seed, ctx, route, roastText, lastEmotion, hasImage, imagePath))
+  })()
 }
 
 function debugLog(data: {
@@ -576,6 +597,10 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
   let usedImage = false
   let primaryReason: RouteReason = 'SKIPPED'
   let flashReason: RouteReason = 'SKIPPED'
+  const interactionLogSeed: InteractionLogSeed = {
+    eventId: createEventId(),
+    timestamp: formatLocalIsoTimestamp()
+  }
 
   const primaryConfig = buildPrimaryConfig()
   const flashConfig = buildFlashConfig(primaryConfig)
@@ -584,6 +609,13 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
     const image = await captureRoastImage(ctx)
     usedImage = Boolean(image)
     const sanitizedCtx = sanitizeWindowContext(ctx)
+    if (image && !sanitizedCtx.isSensitive) {
+      interactionLogSeed.imagePathPromise = saveMemoryCapture(
+        interactionLogSeed.eventId,
+        interactionLogSeed.timestamp,
+        image.dataBase64
+      )
+    }
     const memoryContext = await prepareMemoryContext()
     const primaryPrompt = buildRoastPrompt(sanitizedCtx, style, {
       hasImage: usedImage,
@@ -611,7 +643,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
         primaryReason = 'TOO_SHORT'
         const fallback = getFallbackText(ctx, style)
         queueSessionUpdate(sanitizedCtx, 'LOCAL_FALLBACK', null, false)
-        queueInteractionLog(sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
+        queueInteractionLog(interactionLogSeed, sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
         logResult('TOO_SHORT', ctx, startedAt, {
           route: 'LOCAL_FALLBACK',
           usedFallback: true,
@@ -624,7 +656,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
 
       primaryReason = 'OK'
       queueSessionUpdate(sanitizedCtx, 'PRIMARY', primaryOutput.emotion, usedImage)
-      queueInteractionLog(sanitizedCtx, 'PRIMARY', primaryText, primaryOutput.emotion, usedImage)
+      queueInteractionLog(interactionLogSeed, sanitizedCtx, 'PRIMARY', primaryText, primaryOutput.emotion, usedImage)
       logResult('OK', ctx, startedAt, {
         route: 'PRIMARY',
         usedFallback: false,
@@ -661,7 +693,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
           flashReason = 'TOO_SHORT'
           const fallback = getFallbackText(ctx, style)
           queueSessionUpdate(sanitizedCtx, 'LOCAL_FALLBACK', null, false)
-          queueInteractionLog(sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
+          queueInteractionLog(interactionLogSeed, sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
           logResult('TOO_SHORT', ctx, startedAt, {
             route: 'LOCAL_FALLBACK',
             usedFallback: true,
@@ -674,7 +706,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
 
         flashReason = 'OK'
         queueSessionUpdate(sanitizedCtx, 'FLASH_API', flashOutput.emotion, false)
-        queueInteractionLog(sanitizedCtx, 'FLASH_API', flashText, flashOutput.emotion, false)
+        queueInteractionLog(interactionLogSeed, sanitizedCtx, 'FLASH_API', flashText, flashOutput.emotion, false)
         logResult('OK', ctx, startedAt, {
           route: 'FLASH_API',
           usedFallback: false,
@@ -696,7 +728,7 @@ export async function roast(ctx?: WindowContext, style?: string): Promise<string
     const fallback = getFallbackText(ctx, style)
     const sanitizedCtx = sanitizeWindowContext(ctx)
     queueSessionUpdate(sanitizedCtx, 'LOCAL_FALLBACK', null, false)
-    queueInteractionLog(sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
+    queueInteractionLog(interactionLogSeed, sanitizedCtx, 'LOCAL_FALLBACK', fallback, null, false)
 
     logResult(reason, ctx, startedAt, {
       route: 'LOCAL_FALLBACK',

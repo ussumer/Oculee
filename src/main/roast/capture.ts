@@ -1,6 +1,4 @@
 import { desktopCapturer } from 'electron'
-import { mkdir, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { WindowContext } from '../../shared/types'
 import { dataLoader } from '../dataLoader'
@@ -11,7 +9,6 @@ const DEFAULT_MAX_SIDE = 960
 const MIN_SIDE = 320
 const DEFAULT_CODEC = 'jpeg'
 const DEFAULT_JPEG_QUALITY = 72
-const DEFAULT_DEBUG_CAPTURE_DIR = '.debug/roast-captures'
 const DEFAULT_CAPTURE_MODE: CaptureMode = 'foreground'
 const DEFAULT_THUMBNAIL_SIZE = { width: DEFAULT_MAX_SIDE, height: DEFAULT_MAX_SIDE }
 
@@ -58,10 +55,6 @@ function isMultimodalEnabled(): boolean {
   return parseBoolean(process.env.MULTIMODAL_ENABLED, true)
 }
 
-function isCaptureDumpEnabled(): boolean {
-  return parseBoolean(process.env.MULTIMODAL_DEBUG_DUMP, false)
-}
-
 function isDebugEnabled(): boolean {
   return parseBoolean(process.env.DEBUG_LLM, false)
 }
@@ -96,38 +89,6 @@ function getCaptureMode(config: CaptureConfig): CaptureMode {
     return 'fullscreen'
   }
   return config.captureMode
-}
-
-function getDebugCaptureDir(): string {
-  const custom = process.env.MULTIMODAL_DEBUG_DUMP_DIR?.trim()
-  return custom ? resolve(custom) : resolve(process.cwd(), DEFAULT_DEBUG_CAPTURE_DIR)
-}
-
-function buildDebugCaptureFilename(codec: ImageCodec): string {
-  const now = new Date()
-  const stamp = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, '0'),
-    String(now.getDate()).padStart(2, '0'),
-    '-',
-    String(now.getHours()).padStart(2, '0'),
-    String(now.getMinutes()).padStart(2, '0'),
-    String(now.getSeconds()).padStart(2, '0'),
-    '-',
-    String(now.getMilliseconds()).padStart(3, '0')
-  ].join('')
-  const ext = codec === 'png' ? 'png' : 'jpg'
-  return `capture-${stamp}.${ext}`
-}
-
-async function dumpCaptureForDebug(buffer: Buffer, codec: ImageCodec): Promise<void> {
-  const dir = getDebugCaptureDir()
-  const file = join(dir, buildDebugCaptureFilename(codec))
-  await mkdir(dir, { recursive: true })
-  await writeFile(file, buffer)
-  if (isDebugEnabled()) {
-    console.log('[capture] saved debug image', file)
-  }
 }
 
 function toAsciiSafeText(input: string): string {
@@ -289,14 +250,6 @@ export async function captureRoastImage(ctx?: WindowContext): Promise<LlmImagePa
 
     if (optimized.length === 0) {
       return undefined
-    }
-
-    if (isCaptureDumpEnabled()) {
-      try {
-        await dumpCaptureForDebug(optimized, codec)
-      } catch {
-        // Ignore debug dump errors to avoid blocking roast flow.
-      }
     }
 
     return {

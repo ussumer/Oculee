@@ -34,6 +34,7 @@ export const InteractionEventSchema = z.object({
   titleSafe: z.string().min(1),
   route: InteractionRouteSchema,
   emotion: z.string().min(1).optional(),
+  imagePath: z.string().optional(),
   hasImage: z.boolean(),
   usedFallback: z.boolean(),
   blockedByPrivacy: z.boolean(),
